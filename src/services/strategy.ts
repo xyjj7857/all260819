@@ -218,6 +218,8 @@ export class StrategyEngine {
   private banUntil: number = 0;
   private lockingSymbols: Set<string> = new Set();
   private notifiedDustSymbols: Set<string> = new Set();
+  private reconcilingPositionSymbols: Set<string> = new Set();
+  private reconciledFailedCooldown: Map<string, number> = new Map();
   private isFullMarketMonitoring: boolean = false;
   private lastSubscribedSymbolSet: Set<string> = new Set();
   private onUpdate?: (type: 'log' | 'status' | 'account' | 'logs' | 'tradeLogs' | 'transferLogs' | 'balanceLogs' | 'settings', data: any) => void;
@@ -1890,6 +1892,25 @@ export class StrategyEngine {
         this.noOrdersStartTime = null;
       }
 
+      // 重部署/重启后对账：如果交易所存在实际持仓但本地 tradeLogs 中缺少对应的 OPEN 记录，自动补齐并还原真实开仓时间
+      for (const p of activePositions) {
+        const symbol = p.symbol;
+        const hasOpenTrade = this.tradeLogs.some(t => t.symbol === symbol && t.status === 'OPEN');
+        if (
+          !hasOpenTrade &&
+          !this.isOrdering &&
+          !this.pendingSymbols.has(symbol) &&
+          this.pendingOrderSymbol !== symbol &&
+          !this.lockingSymbols.has(symbol) &&
+          !this.reconcilingPositionSymbols.has(symbol)
+        ) {
+          const lastFail = this.reconciledFailedCooldown.get(symbol) || 0;
+          if (Date.now() - lastFail > 30000) {
+            await this.reconcileMissingOpenTrade(p, combinedOrders);
+          }
+        }
+      }
+
       const totalBalance = account.totalWalletBalance || '0.00';
       const availableBalance = account.availableBalance || '0.00';
       
@@ -2414,18 +2435,143 @@ export class StrategyEngine {
     }
   }
 
+  private async resolvePositionOpenTime(symbol: string, positionAmt: number, posUpdateTime?: number): Promise<number> {
+    const fallbackUpdate = Number(posUpdateTime) || 0;
+    try {
+      const trades = await this.binance.getUserTrades(symbol, 50);
+      if (Array.isArray(trades) && trades.length > 0) {
+        const sorted = [...trades].sort((a: any, b: any) => {
+          const ta = Number(a.time) || 0;
+          const tb = Number(b.time) || 0;
+          if (tb !== ta) return tb - ta;
+          return (Number(b.id) || 0) - (Number(a.id) || 0);
+        });
+
+        let curPos = positionAmt;
+        const targetSign = Math.sign(positionAmt);
+        let openTimeCandidate = 0;
+
+        for (const t of sorted) {
+          const qty = parseFloat(t.qty || '0');
+          if (!qty || isNaN(qty)) continue;
+          const signedDelta = t.side === 'BUY' ? qty : -qty;
+          const tradeTime = Number(t.time) || 0;
+          if (!tradeTime) continue;
+
+          if (Math.sign(signedDelta) === targetSign) {
+            openTimeCandidate = tradeTime;
+          }
+
+          curPos -= signedDelta;
+          if (Math.abs(curPos) < 1e-8 || Math.sign(curPos) !== targetSign) {
+            if (openTimeCandidate > 0) {
+              return openTimeCandidate;
+            }
+            break;
+          }
+        }
+
+        if (fallbackUpdate > 0) return fallbackUpdate;
+        if (openTimeCandidate > 0) return openTimeCandidate;
+      }
+    } catch (e: any) {
+      // 接口失败时回退使用 positionRisk 返回的 updateTime
+    }
+    return fallbackUpdate > 0 ? fallbackUpdate : Date.now();
+  }
+
+  private async reconcileMissingOpenTrade(p: any, combinedOrders: any[]) {
+    const symbol = p.symbol;
+    if (!symbol || this.reconcilingPositionSymbols.has(symbol)) return;
+    this.reconcilingPositionSymbols.add(symbol);
+
+    try {
+      const posAmt = parseFloat(p.positionAmt || '0');
+      if (posAmt === 0) return;
+
+      const openTime = await this.resolvePositionOpenTime(symbol, posAmt, p.updateTime);
+      const side: 'BUY' | 'SELL' = posAmt > 0 ? 'BUY' : 'SELL';
+      const amount = Math.abs(posAmt);
+      const entryPrice = parseFloat(p.entryPrice || '0');
+      const leverage = Math.max(1, parseFloat(p.leverage || '1'));
+
+      const symbolOrders = (combinedOrders || []).filter((o: any) => o.symbol === symbol);
+      const limitOrder = symbolOrders.find((o: any) => !o.isAlgo);
+      const algoOrder = symbolOrders.find((o: any) => o.isAlgo);
+
+      const recoveredId = `recovered_${symbol}_${openTime}`;
+      if (this.tradeLogs.some(t => t.id === recoveredId || (t.symbol === symbol && t.status === 'OPEN'))) {
+        return;
+      }
+
+      const recoveredLog: TradeLog = {
+        id: recoveredId,
+        accountId: this.accountId,
+        symbol,
+        side,
+        leverage,
+        amount,
+        entryPrice,
+        exitPrice: 0,
+        expiryPrice: 0,
+        pnl: 0,
+        fee: 0,
+        fundingFee: 0,
+        fundingFeeCheckedCount: 0,
+        profitRate: 0,
+        openTime,
+        closeTime: 0,
+        status: 'OPEN',
+        tpOrderId: limitOrder ? (limitOrder.orderId || '').toString() : undefined,
+        slOrderId: algoOrder ? (algoOrder.algoId || algoOrder.orderId || '').toString() : undefined
+      };
+
+      this.addTradeLog(recoveredLog);
+      this.addLog(
+        '系统',
+        `[持仓恢复] 检测到已有持仓但本地缺少 OPEN 记录，已自动补全 ${symbol} 持仓日志，还原真实开仓时间: ${new Date(openTime + 8 * 3600 * 1000).toISOString().replace('T', ' ').substring(0, 19)}`,
+        'info'
+      );
+    } catch (err: any) {
+      this.reconciledFailedCooldown.set(symbol, Date.now());
+      this.addLog('系统', `[持仓恢复] 补全 ${symbol} 持仓记录失败: ${err.message}`, 'warning');
+    } finally {
+      this.reconcilingPositionSymbols.delete(symbol);
+    }
+  }
+
   private async checkPositionTimeout() {
     if (this.checkBannedStatus() || !this.settings.order?.maxHoldTime) return;
 
     const openTrades = this.tradeLogs.filter(t => t.status === 'OPEN');
-    if (openTrades.length === 0) return;
+    const candidateMap = new Map<string, { symbol: string; openTime: number }>();
 
-    const sortedOpenTrades = [...openTrades].sort((a, b) => a.openTime - b.openTime);
+    for (const trade of openTrades) {
+      if (!trade.symbol || !trade.openTime) continue;
+      const existing = candidateMap.get(trade.symbol);
+      if (!existing || trade.openTime < existing.openTime) {
+        candidateMap.set(trade.symbol, { symbol: trade.symbol, openTime: trade.openTime });
+      }
+    }
+
+    // 兜底：若真实持仓中存在尚未生成本地 OPEN 日志的仓位，直接使用币安持仓 updateTime 参与最大持仓时间检查
+    const livePositions = this.accountData?.positions || [];
+    for (const pos of livePositions) {
+      if (!pos?.symbol || candidateMap.has(pos.symbol)) continue;
+      const posOpenTime = Number(pos.updateTime) || 0;
+      if (posOpenTime > 0) {
+        candidateMap.set(pos.symbol, { symbol: pos.symbol, openTime: posOpenTime });
+      }
+    }
+
+    if (candidateMap.size === 0) return;
+
+    const sortedOpenEntries = Array.from(candidateMap.values()).sort((a, b) => a.openTime - b.openTime);
     const now = Date.now() + this.timeOffset;
 
-    for (let index = 0; index < sortedOpenTrades.length; index++) {
-      const trade = sortedOpenTrades[index];
-      const symbol = trade.symbol;
+    for (let index = 0; index < sortedOpenEntries.length; index++) {
+      const entry = sortedOpenEntries[index];
+      const symbol = entry.symbol;
       if (this.lockingSymbols.has(symbol)) continue;
 
       const isSecond = index === 1 && !!this.settings.order?.secondOrderCustomEnabled;
@@ -2434,7 +2580,7 @@ export class StrategyEngine {
         : this.settings.order.maxHoldTime;
 
       const maxHoldTimeMs = maxHoldTimeVal * 60 * 1000;
-      const holdTimeMs = now - trade.openTime;
+      const holdTimeMs = now - entry.openTime;
 
       if (holdTimeMs >= maxHoldTimeMs) {
         this.addLog('策略', `${isSecond ? '第二' : '第一'}仓单持仓时间已达上限 (${maxHoldTimeVal} 分钟)，正在强制平仓并撤销所有订单: ${symbol}`, 'warning');
@@ -2449,20 +2595,20 @@ export class StrategyEngine {
     const trailingStartMinutes = this.settings.order?.trailingStartMinutes ?? 3;
     const trailingCloseRatio = this.settings.order?.trailingCloseRatio ?? 0;
 
-    const openTrades = this.tradeLogs.filter(t => t.status === 'OPEN');
-    if (openTrades.length === 0) return;
+    const livePositions = this.accountData?.positions || [];
+    if (livePositions.length === 0) return;
 
     const now = Date.now() + this.timeOffset;
 
-    for (const trade of openTrades) {
-      const symbol = trade.symbol;
-      if (this.lockingSymbols.has(symbol)) continue;
+    for (const pos of livePositions) {
+      const symbol = pos.symbol;
+      if (!symbol || this.lockingSymbols.has(symbol)) continue;
 
-      // 检查该币种在 accountData.positions 中是否真的存在
-      const pos = (this.accountData?.positions || []).find((p: any) => p.symbol === symbol);
-      if (!pos) continue;
+      const openTrade = this.tradeLogs.find(t => t.symbol === symbol && t.status === 'OPEN');
+      const openTime = openTrade?.openTime || Number(pos.updateTime) || 0;
+      if (!openTime) continue;
 
-      const holdTimeMs = now - trade.openTime;
+      const holdTimeMs = now - openTime;
       const trailingStartMs = trailingStartMinutes * 60 * 1000;
 
       if (holdTimeMs >= trailingStartMs) {
@@ -5055,6 +5201,138 @@ export class StrategyEngine {
       this.addLog('系统', `本地搜索失败: ${error.message}`, 'error');
       return [];
     }
+  }
+
+  async importTradeLogs(rawLogs: Partial<TradeLog>[]) {
+    if (!Array.isArray(rawLogs) || rawLogs.length === 0) {
+      return { importedCount: 0, skippedCount: 0, totalCount: this.tradeLogs.length, logs: this.tradeLogs };
+    }
+
+    await dbService.init();
+
+    const validStatuses = new Set(['OPEN', 'CLOSED', 'SKIPPED', 'TP', 'SL', 'TIMEOUT', 'TRAILING']);
+    const toFiniteNum = (val: any, fallback: number = 0): number => {
+      const n = Number(val);
+      return Number.isFinite(n) ? n : fallback;
+    };
+    const toOptionalNum = (val: any): number | undefined => {
+      if (val === undefined || val === null || val === '') return undefined;
+      const n = Number(val);
+      return Number.isFinite(n) ? n : undefined;
+    };
+
+    const existingMemoryIds = new Set(this.tradeLogs.map(t => String(t.id)));
+    const normalizedLogs: TradeLog[] = [];
+    let skippedMemoryDuplicates = 0;
+
+    for (let i = 0; i < rawLogs.length; i++) {
+      const raw = rawLogs[i];
+      if (!raw || typeof raw !== 'object') continue;
+
+      const rawSymbol = String(raw.symbol || '').trim();
+      const isSkipMark = Boolean(
+        raw.isSkipMark ||
+        raw.status === 'SKIPPED' ||
+        rawSymbol === '[扫跳重置]'
+      );
+
+      if (!rawSymbol && !isSkipMark) continue;
+
+      const symbol = isSkipMark ? '[扫跳重置]' : rawSymbol.toUpperCase();
+      const side: 'BUY' | 'SELL' = String(raw.side || '').toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
+      const openTime = toFiniteNum(raw.openTime, 0);
+      const closeTime = toFiniteNum(raw.closeTime, openTime);
+      const entryPrice = isSkipMark ? 0 : toFiniteNum(raw.entryPrice, 0);
+      const exitPrice = isSkipMark ? 0 : toFiniteNum(raw.exitPrice, 0);
+      const pnl = isSkipMark ? 0 : toFiniteNum(raw.pnl, 0);
+
+      let id = String(raw.id || '').trim();
+      if (!id) {
+        id = `imp_${symbol}_${side}_${openTime}_${closeTime}_${entryPrice}_${exitPrice}_${pnl}_${i}`;
+      }
+
+      if (existingMemoryIds.has(id)) {
+        skippedMemoryDuplicates++;
+        continue;
+      }
+
+      const rawStatus = String(raw.status || '').toUpperCase();
+      const status = isSkipMark
+        ? 'SKIPPED'
+        : ((validStatuses.has(rawStatus) ? rawStatus : 'CLOSED') as TradeLog['status']);
+
+      const normalized: TradeLog = {
+        id,
+        accountId: this.accountId,
+        symbol,
+        side,
+        leverage: isSkipMark ? 1 : Math.max(1, toFiniteNum(raw.leverage, 1)),
+        amount: isSkipMark ? 0 : toFiniteNum(raw.amount, 0),
+        entryPrice,
+        exitPrice,
+        expiryPrice: isSkipMark ? 0 : toOptionalNum(raw.expiryPrice),
+        pnl,
+        fee: isSkipMark ? 0 : toFiniteNum(raw.fee, 0),
+        fundingFee: isSkipMark ? 0 : toFiniteNum(raw.fundingFee, 0),
+        fundingFeeCheckedCount: toFiniteNum(raw.fundingFeeCheckedCount, 0),
+        fundingRate: isSkipMark ? undefined : toOptionalNum(raw.fundingRate),
+        profitRate: isSkipMark ? 0 : toFiniteNum(raw.profitRate, 0),
+        kBestChange: toOptionalNum(raw.kBestChange),
+        amp: isSkipMark ? undefined : toOptionalNum(raw.amp),
+        mValue: isSkipMark ? undefined : toOptionalNum(raw.mValue),
+        realA: isSkipMark ? undefined : toOptionalNum(raw.realA),
+        k2: isSkipMark ? undefined : toOptionalNum(raw.k2),
+        openTime,
+        closeTime,
+        status,
+        isSkipMark: isSkipMark || undefined,
+        tpOrderId: raw.tpOrderId ? String(raw.tpOrderId) : undefined,
+        slOrderId: raw.slOrderId ? String(raw.slOrderId) : undefined,
+        strategyType: raw.strategyType ? String(raw.strategyType) : undefined
+      };
+
+      normalizedLogs.push(normalized);
+    }
+
+    const { inserted, skippedCount: dbSkippedCount } = await dbService.saveTradeLogsBatch(normalizedLogs, this.accountId);
+    const totalSkipped = skippedMemoryDuplicates + dbSkippedCount;
+
+    // Ensure any pre-existing DB logs are also in memory if engine wasn't started yet
+    const dbLogs = await dbService.getAllTradeLogs(this.accountId);
+    const mergedMap = new Map<string, TradeLog>();
+
+    for (const log of dbLogs) {
+      mergedMap.set(String(log.id), log);
+    }
+    for (const log of this.tradeLogs) {
+      mergedMap.set(String(log.id), log);
+    }
+    for (const log of inserted) {
+      mergedMap.set(String(log.id), log);
+    }
+
+    this.tradeLogs = Array.from(mergedMap.values()).sort((a, b) => {
+      const timeA = a.openTime || a.closeTime || 0;
+      const timeB = b.openTime || b.closeTime || 0;
+      return timeB - timeA;
+    });
+
+    if (this.onUpdate) {
+      this.onUpdate('tradeLogs', this.tradeLogs);
+    }
+
+    this.addLog(
+      '系统',
+      `导入历史交易日志完成: 新增 ${inserted.length} 条${totalSkipped > 0 ? `，跳过重复 ${totalSkipped} 条` : ''}`,
+      'success'
+    );
+
+    return {
+      importedCount: inserted.length,
+      skippedCount: totalSkipped,
+      totalCount: this.tradeLogs.length,
+      logs: this.tradeLogs
+    };
   }
 
   getLogs() {

@@ -1,5 +1,5 @@
-import React, { useState, useMemo } from 'react';
-import { History, Download, Trash2, Calendar, Search, Filter, RefreshCw } from 'lucide-react';
+import React, { useState, useMemo, useRef } from 'react';
+import { History, Download, Upload, Trash2, Calendar, Search, Filter, RefreshCw, CheckCircle2, AlertCircle, X } from 'lucide-react';
 import { TradeLog } from '../types';
 
 const formatPrice = (val: number | string | undefined | null): string => {
@@ -30,11 +30,335 @@ const formatPrice = (val: number | string | undefined | null): string => {
   return result;
 };
 
-export default function TradeLogs({ tradeLogs, onClear, accountId }: { tradeLogs: TradeLog[], onClear: () => void, accountId: string }) {
+const parseCsvRows = (text: string): string[][] => {
+  const clean = text.replace(/^\uFEFF/, '');
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < clean.length; i++) {
+    const ch = clean[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (clean[i + 1] === '"') {
+          cell += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cell += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(cell.trim());
+      cell = '';
+    } else if (ch === '\r') {
+      if (clean[i + 1] === '\n') i++;
+      row.push(cell.trim());
+      if (row.some(c => c !== '')) rows.push(row);
+      row = [];
+      cell = '';
+    } else if (ch === '\n') {
+      row.push(cell.trim());
+      if (row.some(c => c !== '')) rows.push(row);
+      row = [];
+      cell = '';
+    } else {
+      cell += ch;
+    }
+  }
+
+  if (cell.length > 0 || row.length > 0) {
+    row.push(cell.trim());
+    if (row.some(c => c !== '')) rows.push(row);
+  }
+  return rows;
+};
+
+const parseTimeMs = (raw?: string): number => {
+  if (!raw) return 0;
+  const val = raw.trim();
+  if (!val || val === '--' || val === '-') return 0;
+  if (/^\d{10,13}$/.test(val)) {
+    const num = Number(val);
+    return val.length <= 10 ? num * 1000 : num;
+  }
+  const normalized = val.replace(/\//g, '-');
+  const match = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+  if (match) {
+    const [, y, m, d, hh = '00', mm = '00', ss = '00'] = match;
+    const iso = `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}T${hh.padStart(2, '0')}:${mm.padStart(2, '0')}:${ss.padStart(2, '0')}+08:00`;
+    const ts = Date.parse(iso);
+    return Number.isFinite(ts) ? ts : 0;
+  }
+  const ts = Date.parse(val);
+  return Number.isFinite(ts) ? ts : 0;
+};
+
+const parseNum = (raw?: string): number | undefined => {
+  if (raw === undefined || raw === null) return undefined;
+  const cleaned = raw.trim().replace(/,/g, '').replace(/[%xX]$/g, '');
+  if (!cleaned || cleaned === '--' || cleaned === '-' || cleaned.toUpperCase() === 'N/A') return undefined;
+  const num = Number(cleaned);
+  return Number.isFinite(num) ? num : undefined;
+};
+
+const parseTradeLogsFromText = (text: string, fileName: string): Partial<TradeLog>[] => {
+  const trimmed = text.replace(/^\uFEFF/, '').trim();
+  if (!trimmed) return [];
+
+  if (fileName.toLowerCase().endsWith('.json') || trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    const parsed = JSON.parse(trimmed);
+    const arr = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed?.logs)
+      ? parsed.logs
+      : Array.isArray(parsed?.tradeLogs)
+      ? parsed.tradeLogs
+      : null;
+    if (!arr) {
+      throw new Error('JSON 文件中未找到交易日志数组');
+    }
+    return arr;
+  }
+
+  const rows = parseCsvRows(trimmed);
+  if (rows.length === 0) return [];
+
+  const firstRow = rows[0].map(c => c.trim());
+  const headerKeywords = ['ID', '合约', '方向', '盈亏', '开仓时间', '状态', 'symbol', 'pnl', 'openTime'];
+  const hasHeader = firstRow.some(col => headerKeywords.includes(col) || headerKeywords.includes(col.toLowerCase()));
+
+  const defaultColIndex: Record<string, number> = {
+    id: 0,
+    symbol: 1,
+    direction: 2,
+    leverage: 3,
+    amount: 4,
+    fundingRate: 5,
+    amp: 6,
+    mValue: 7,
+    realA: 8,
+    k2: 9,
+    entryPrice: 10,
+    exitPrice: 11,
+    expiryPrice: 12,
+    pnl: 13,
+    fee: 15,
+    profitRate: 16,
+    openTime: 17,
+    closeTime: 18,
+    status: 19
+  };
+
+  let colMap: Record<string, number> = { ...defaultColIndex };
+  let startIdx = 0;
+
+  if (hasHeader) {
+    startIdx = 1;
+    colMap = {};
+    firstRow.forEach((header, idx) => {
+      const h = header.toLowerCase();
+      if (h === 'id') colMap.id = idx;
+      else if (header === '合约' || h === 'symbol') colMap.symbol = idx;
+      else if (header === '方向' || h === 'direction' || h === 'side') colMap.direction = idx;
+      else if (header === '杠杆' || h === 'leverage') colMap.leverage = idx;
+      else if (header === '数量' || h === 'amount') colMap.amount = idx;
+      else if (header.includes('资金费率') || h === 'fundingrate') colMap.fundingRate = idx;
+      else if (header === '资金费' || h === 'fundingfee') colMap.fundingFee = idx;
+      else if (header === '振幅' || h === 'amp') colMap.amp = idx;
+      else if (header === 'M值' || h === 'mvalue') colMap.mValue = idx;
+      else if (header === '真实A' || h === 'reala') colMap.realA = idx;
+      else if (header === '单K2' || h === 'k2') colMap.k2 = idx;
+      else if (header === '开仓价' || h === 'entryprice') colMap.entryPrice = idx;
+      else if (header === '平仓价' || h === 'exitprice') colMap.exitPrice = idx;
+      else if (header === '到期价格' || h === 'expiryprice') colMap.expiryPrice = idx;
+      else if (header === '盈亏' || h === 'pnl') colMap.pnl = idx;
+      else if (header === '手续费' || h === 'fee') colMap.fee = idx;
+      else if (header === '利润率' || h === 'profitrate') colMap.profitRate = idx;
+      else if (header === '开仓时间' || h === 'opentime') colMap.openTime = idx;
+      else if (header === '平仓时间' || h === 'closetime') colMap.closeTime = idx;
+      else if (header === '状态' || h === 'status') colMap.status = idx;
+      else if (header === '策略类型' || h === 'strategytype') colMap.strategyType = idx;
+    });
+  }
+
+  const getCell = (r: string[], key: string): string => {
+    const idx = colMap[key];
+    return idx !== undefined && idx >= 0 && idx < r.length ? r[idx] : '';
+  };
+
+  const results: Partial<TradeLog>[] = [];
+  for (let i = startIdx; i < rows.length; i++) {
+    const r = rows[i];
+    const id = getCell(r, 'id');
+    const symbolRaw = getCell(r, 'symbol');
+    const dirRaw = getCell(r, 'direction');
+    const statusRaw = getCell(r, 'status');
+
+    const isSkipMark =
+      symbolRaw === '[扫跳重置]' ||
+      dirRaw === '系统' ||
+      statusRaw === '已跳过' ||
+      statusRaw.toUpperCase() === 'SKIPPED';
+
+    if (!symbolRaw && !isSkipMark) continue;
+
+    const openTime = parseTimeMs(getCell(r, 'openTime'));
+    const closeTime = parseTimeMs(getCell(r, 'closeTime'));
+
+    if (isSkipMark) {
+      results.push({
+        id: id || undefined,
+        symbol: '[扫跳重置]',
+        side: 'BUY',
+        leverage: 1,
+        amount: 0,
+        entryPrice: 0,
+        exitPrice: 0,
+        expiryPrice: 0,
+        pnl: 0,
+        fee: 0,
+        fundingFee: 0,
+        profitRate: 0,
+        openTime,
+        closeTime: closeTime || openTime,
+        status: 'SKIPPED',
+        isSkipMark: true
+      });
+      continue;
+    }
+
+    let side: 'BUY' | 'SELL' = 'BUY';
+    let strategyType = getCell(r, 'strategyType') || undefined;
+    if (dirRaw === 'k多') {
+      side = 'BUY';
+      strategyType = strategyType || 'singleK';
+    } else if (dirRaw === 'k空') {
+      side = 'SELL';
+      strategyType = strategyType || 'singleK';
+    } else if (dirRaw === '振多') {
+      side = 'BUY';
+      strategyType = strategyType || 'amplitude';
+    } else if (dirRaw === '振空') {
+      side = 'SELL';
+      strategyType = strategyType || 'amplitude';
+    } else if (/sell|short|空/i.test(dirRaw)) {
+      side = 'SELL';
+    } else {
+      side = 'BUY';
+    }
+
+    const fundingRateCell = getCell(r, 'fundingRate');
+    const fundingRateParsed = parseNum(fundingRateCell);
+    const fundingRate =
+      fundingRateParsed !== undefined
+        ? (fundingRateCell.includes('%') ? fundingRateParsed / 100 : fundingRateParsed)
+        : undefined;
+
+    let status: TradeLog['status'] = 'CLOSED';
+    const sUpper = statusRaw.toUpperCase();
+    if (statusRaw === '持仓中' || sUpper === 'OPEN') status = 'OPEN';
+    else if (statusRaw === '止盈' || sUpper === 'TP') status = 'TP';
+    else if (statusRaw === '止损' || sUpper === 'SL') status = 'SL';
+    else if (statusRaw === '到期' || sUpper === 'TIMEOUT') status = 'TIMEOUT';
+    else if (statusRaw === '追踪' || sUpper === 'TRAILING') status = 'TRAILING';
+    else if (statusRaw === '已跳过' || sUpper === 'SKIPPED') status = 'SKIPPED';
+
+    results.push({
+      id: id || undefined,
+      symbol: symbolRaw.toUpperCase(),
+      side,
+      leverage: parseNum(getCell(r, 'leverage')) ?? 1,
+      amount: parseNum(getCell(r, 'amount')) ?? 0,
+      fundingRate,
+      amp: parseNum(getCell(r, 'amp')),
+      mValue: parseNum(getCell(r, 'mValue')),
+      realA: parseNum(getCell(r, 'realA')),
+      k2: parseNum(getCell(r, 'k2')),
+      entryPrice: parseNum(getCell(r, 'entryPrice')) ?? 0,
+      exitPrice: parseNum(getCell(r, 'exitPrice')) ?? 0,
+      expiryPrice: parseNum(getCell(r, 'expiryPrice')) ?? 0,
+      pnl: parseNum(getCell(r, 'pnl')) ?? 0,
+      fee: parseNum(getCell(r, 'fee')) ?? 0,
+      fundingFee: parseNum(getCell(r, 'fundingFee')) ?? 0,
+      profitRate: parseNum(getCell(r, 'profitRate')) ?? 0,
+      openTime,
+      closeTime: status === 'OPEN' ? closeTime : (closeTime || openTime),
+      status,
+      strategyType
+    });
+  }
+
+  return results;
+};
+
+export default function TradeLogs({
+  tradeLogs,
+  onClear,
+  accountId,
+  accountName,
+  onImportSuccess
+}: {
+  tradeLogs: TradeLog[];
+  onClear: () => void;
+  accountId: string;
+  accountName?: string;
+  onImportSuccess?: (logs: TradeLog[]) => void;
+}) {
   const [startTime, setStartTime] = useState('');
   const [endTime, setEndTime] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const [importNotice, setImportNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsImporting(true);
+    setImportNotice(null);
+
+    try {
+      const text = await file.text();
+      const parsedLogs = parseTradeLogsFromText(text, file.name);
+      if (parsedLogs.length === 0) {
+        setImportNotice({ type: 'error', message: '未从文件中解析到有效的交易日志记录，请检查文件内容。' });
+        return;
+      }
+
+      const res = await fetch(`/api/trade-logs/import?accountId=${accountId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs: parsedLogs })
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setImportNotice({ type: 'error', message: `导入失败: ${data.message || res.statusText}` });
+        return;
+      }
+
+      if (onImportSuccess && Array.isArray(data.logs)) {
+        onImportSuccess(data.logs);
+      }
+
+      setImportNotice({
+        type: 'success',
+        message: `导入完成：新增 ${data.importedCount} 条历史交易日志${data.skippedCount > 0 ? `，已自动跳过 ${data.skippedCount} 条重复记录` : ''}。`
+      });
+    } catch (err: any) {
+      setImportNotice({ type: 'error', message: `导入失败: ${err?.message || '文件解析异常'}` });
+    } finally {
+      setIsImporting(false);
+      e.target.value = '';
+    }
+  };
 
   const handleForceSearch = async () => {
     const isAll = !searchTerm;
@@ -263,7 +587,13 @@ export default function TradeLogs({ tradeLogs, onClear, accountId }: { tradeLogs
     const link = document.createElement('a');
     const url = URL.createObjectURL(blob);
     link.setAttribute('href', url);
-    link.setAttribute('download', `trade_logs_${new Date().toISOString().split('T')[0]}.csv`);
+    const rawAccountLabel = (accountName || accountId || '').trim();
+    const safeAccountLabel = rawAccountLabel.replace(/[\\/:*?"<>|]/g, '_').trim();
+    const dateStr = new Date().toISOString().split('T')[0];
+    const fileName = safeAccountLabel
+      ? `trade_logs_${safeAccountLabel}_${dateStr}.csv`
+      : `trade_logs_${dateStr}.csv`;
+    link.setAttribute('download', fileName);
     link.style.visibility = 'hidden';
     document.body.appendChild(link);
     link.click();
@@ -334,6 +664,23 @@ export default function TradeLogs({ tradeLogs, onClear, accountId }: { tradeLogs
                 onChange={(e) => setSearchTerm(e.target.value)}
               />
             </div>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.json,text/csv,application/json"
+              className="hidden"
+              onChange={handleImportFile}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isImporting}
+              className={`flex items-center gap-1.5 px-4 py-2 bg-indigo-50 text-indigo-600 rounded-xl text-[11px] font-black uppercase tracking-wider hover:bg-indigo-100 transition-all active:scale-95 ${isImporting ? 'opacity-50 cursor-not-allowed' : ''}`}
+            >
+              {isImporting ? <RefreshCw size={14} className="animate-spin" /> : <Upload size={14} />}
+              {isImporting ? '导入中...' : '导入'}
+            </button>
             
             <div className="flex items-center gap-2 bg-slate-50 p-1 rounded-xl border border-slate-100">
               <div className="flex items-center gap-1.5 px-2">
@@ -377,6 +724,29 @@ export default function TradeLogs({ tradeLogs, onClear, accountId }: { tradeLogs
             </button>
           </div>
         </div>
+
+        {importNotice && (
+          <div
+            className={`mb-6 flex items-center justify-between gap-3 px-4 py-3 rounded-xl border text-xs font-bold ${
+              importNotice.type === 'success'
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                : 'bg-red-50 border-red-200 text-red-700'
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              {importNotice.type === 'success' ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}
+              <span>{importNotice.message}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setImportNotice(null)}
+              className="p-1 rounded-lg hover:bg-black/5 transition-colors"
+              aria-label="关闭提示"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
 
         <div className="overflow-x-auto">
           <table className="w-full text-left table-fixed">

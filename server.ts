@@ -234,7 +234,7 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: '50mb' }));
   app.use(cookieParser());
 
   const unlockLimiter = rateLimit({
@@ -887,6 +887,19 @@ async function startServer() {
       const { symbol, startTime, endTime } = req.body;
       const logs = await req.engine.searchTradeLogsLocally(symbol, startTime, endTime);
       res.json({ success: true, logs });
+    } catch (error: any) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  });
+
+  app.post("/api/trade-logs/import", engineMiddleware, async (req: any, res) => {
+    try {
+      const { logs } = req.body || {};
+      if (!Array.isArray(logs)) {
+        return res.status(400).json({ success: false, message: "无效的交易日志数据格式" });
+      }
+      const result = await req.engine.importTradeLogs(logs);
+      res.json({ success: true, ...result });
     } catch (error: any) {
       res.status(500).json({ success: false, message: error.message });
     }

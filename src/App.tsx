@@ -713,7 +713,15 @@ export default function App() {
                   setModulePassword={setModulePassword} 
                   onUnlock={handleModuleUnlock}
                 >
-                  <TradeLogs tradeLogs={tradeLogs} onClear={handleClearTradeLogs} accountId={selectedAccountId} />
+                  <TradeLogs
+                    tradeLogs={tradeLogs}
+                    onClear={handleClearTradeLogs}
+                    accountId={selectedAccountId}
+                    accountName={accounts.find(a => a.id === selectedAccountId)?.name || selectedAccountId}
+                    onImportSuccess={(importedLogs) => {
+                      setTradeLogs(importedLogs.filter((t: any) => !t.accountId || t.accountId === selectedAccountId));
+                    }}
+                  />
                 </ProtectedRoute>
               } />
               <Route path="/balance" element={

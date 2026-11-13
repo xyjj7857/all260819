@@ -315,6 +315,72 @@ export class DatabaseService {
     }
   }
 
+  async saveTradeLogsBatch(logs: TradeLog[], accountId: string = 'default'): Promise<{ inserted: TradeLog[]; skippedCount: number }> {
+    if (!this.db || logs.length === 0) return { inserted: [], skippedCount: 0 };
+
+    try {
+      const checkStmt = this.db.prepare(`SELECT accountId FROM trade_logs WHERE id = ?`);
+      const insertStmt = this.db.prepare(`
+        INSERT INTO trade_logs (
+          id, accountId, symbol, side, leverage, amount, entryPrice, exitPrice, expiryPrice, pnl, fee, fundingFee, fundingFeeCheckedCount, fundingRate, profitRate, kBestChange, amp, mValue, realA, k2, openTime, closeTime, status, tpOrderId, slOrderId, strategyType
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      const inserted: TradeLog[] = [];
+      let skippedCount = 0;
+      const seenBatchIds = new Set<string>();
+
+      const transaction = this.db.transaction((items: TradeLog[]) => {
+        for (const rawLog of items) {
+          let targetId = String(rawLog.id || '').trim();
+          if (!targetId) continue;
+
+          const existing = checkStmt.get(targetId) as { accountId?: string } | undefined;
+          if (existing) {
+            if (existing.accountId === accountId) {
+              skippedCount++;
+              continue;
+            }
+            targetId = `${accountId}_${targetId}`;
+            const scopedExisting = checkStmt.get(targetId) as { accountId?: string } | undefined;
+            if (scopedExisting) {
+              skippedCount++;
+              continue;
+            }
+          }
+
+          if (seenBatchIds.has(targetId)) {
+            skippedCount++;
+            continue;
+          }
+          seenBatchIds.add(targetId);
+
+          const normalized: TradeLog = {
+            ...rawLog,
+            id: targetId,
+            accountId
+          };
+
+          insertStmt.run(
+            normalized.id, accountId, normalized.symbol, normalized.side, normalized.leverage, normalized.amount,
+            normalized.entryPrice, normalized.exitPrice, normalized.expiryPrice || 0, normalized.pnl, normalized.fee,
+            normalized.fundingFee, normalized.fundingFeeCheckedCount || 0, normalized.fundingRate ?? 0, normalized.profitRate,
+            normalized.kBestChange || 0, normalized.amp ?? 0, normalized.mValue ?? 0, normalized.realA ?? 0, normalized.k2 ?? 0,
+            normalized.openTime, normalized.closeTime, normalized.status, normalized.tpOrderId || null,
+            normalized.slOrderId || null, normalized.strategyType || null
+          );
+          inserted.push(normalized);
+        }
+      });
+
+      transaction(logs);
+      return { inserted, skippedCount };
+    } catch (error) {
+      console.error('Failed to save trade logs batch:', error);
+      throw error;
+    }
+  }
+
   async getTradeLogs(accountId: string = 'default', symbol?: string, startTime?: number, endTime?: number): Promise<TradeLog[]> {
     if (!this.db) return [];
     try {
