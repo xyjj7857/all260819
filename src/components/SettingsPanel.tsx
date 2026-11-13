@@ -831,6 +831,8 @@ export default function SettingsPanel({
 
                         {(() => {
                           const conds = {
+                            buyStrategyEnabled: localSettings.scanner?.stage2?.conditions?.longShort?.buyEnabled !== false,
+                            sellStrategyEnabled: localSettings.scanner?.stage2?.conditions?.longShort?.sellEnabled ?? false,
                             amp: { enabled: true, range: [10, 30] as [number, number] },
                             ampSell: { enabled: true, range: [10, 30] as [number, number] },
                             longShort: { enabled: true, buyEnabled: true, buy: 80, sellEnabled: true, sell: 20 },
@@ -844,14 +846,24 @@ export default function SettingsPanel({
                           if (!conds.mSell) conds.mSell = { ...conds.m };
                           if (!conds.fundingRateOptimizationSell) conds.fundingRateOptimizationSell = { ...(conds.fundingRateOptimization || { enabled: true, windowMinutes: 5, shortThreshold: -0.3 }) };
 
+                          const isAmpBuyActive = conds.buyStrategyEnabled !== false;
+                          const isAmpSellActive = conds.sellStrategyEnabled !== false;
+
                           return (
                             <div className="space-y-6">
                               {/* 多单过滤标题 */}
-                              <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
+                              <div className="pt-2 border-t border-slate-100 flex items-center gap-3">
                                 <span className="text-xs font-black text-emerald-600 uppercase tracking-wider">📈 多单过滤参数 (BUY)</span>
+                                <Toggle
+                                  enabled={isAmpBuyActive}
+                                  onChange={e => {
+                                    const newConds = { ...conds, buyStrategyEnabled: e };
+                                    setLocalSettings({...localSettings, scanner: {...localSettings.scanner, stage2: {...localSettings.scanner.stage2, conditions: newConds}}});
+                                  }}
+                                />
                               </div>
 
-                              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                              <div className={`grid grid-cols-1 md:grid-cols-3 gap-6 transition-opacity ${isAmpBuyActive ? '' : 'opacity-50'}`}>
                                 {/* AMP 过滤 (多) */}
                                 <div className="p-5 bg-slate-50/50 rounded-3xl border border-slate-100 space-y-4">
                                   <div className="flex items-center justify-between border-b border-slate-100 pb-2">
@@ -911,11 +923,18 @@ export default function SettingsPanel({
                               </div>
 
                               {/* 空单过滤标题 */}
-                              <div className="pt-4 border-t border-slate-100 flex items-center justify-between">
+                              <div className="pt-4 border-t border-slate-100 flex items-center gap-3">
                                 <span className="text-xs font-black text-rose-500 uppercase tracking-wider">📉 空单过滤参数 (SELL)</span>
+                                <Toggle
+                                  enabled={isAmpSellActive}
+                                  onChange={e => {
+                                    const newConds = { ...conds, sellStrategyEnabled: e };
+                                    setLocalSettings({...localSettings, scanner: {...localSettings.scanner, stage2: {...localSettings.scanner.stage2, conditions: newConds}}});
+                                  }}
+                                />
                               </div>
 
-                              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                              <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 transition-opacity ${isAmpSellActive ? '' : 'opacity-50'}`}>
                                 {/* AMP 过滤 (空) */}
                                 <div className="p-5 bg-slate-50/50 rounded-3xl border border-slate-100 space-y-4">
                                   <div className="flex items-center justify-between border-b border-slate-100 pb-2">
@@ -1005,6 +1024,8 @@ export default function SettingsPanel({
                   {(() => {
                     const singleK = {
                       enabled: false,
+                      buyStrategyEnabled: true,
+                      sellStrategyEnabled: true,
                       preferredMode: 'volume' as const,
                       k2: { enabled: true, range: [4, 9] as [number, number] },
                       a: { enabled: true, range: [0, 3] as [number, number], mode: 'fixed' as const },
@@ -1015,6 +1036,8 @@ export default function SettingsPanel({
                       fundingRateOptimizationSell: { enabled: true, windowMinutes: 5, shortThreshold: -0.3 },
                       ...(localSettings.scanner?.stage2?.singleK || {})
                     };
+                    const isSingleKBuyActive = singleK.buyStrategyEnabled !== false;
+                    const isSingleKSellActive = singleK.sellStrategyEnabled !== false;
                     if (!singleK.k2Sell) {
                       singleK.k2Sell = { enabled: true, range: [4, 9] };
                     }
@@ -1070,11 +1093,15 @@ export default function SettingsPanel({
                             </div>
 
                             {/* 多单过滤标题 */}
-                            <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
+                            <div className="pt-2 border-t border-slate-100 flex items-center gap-3">
                               <span className="text-xs font-black text-emerald-600 uppercase tracking-wider">📈 多单过滤参数 (BUY)</span>
+                              <Toggle
+                                enabled={isSingleKBuyActive}
+                                onChange={e => updateSingleK({ ...singleK, buyStrategyEnabled: e })}
+                              />
                             </div>
 
-                            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <div className={`grid grid-cols-1 md:grid-cols-3 gap-6 transition-opacity ${isSingleKBuyActive ? '' : 'opacity-50'}`}>
                               {/* K2 过滤 */}
                               <div className="p-5 bg-slate-50/50 rounded-3xl border border-slate-100 space-y-4">
                                 <div className="flex items-center justify-between border-b border-slate-100 pb-2">
@@ -1127,11 +1154,15 @@ export default function SettingsPanel({
                             </div>
 
                             {/* 空单过滤标题 */}
-                            <div className="pt-4 border-t border-slate-100 flex items-center justify-between">
+                            <div className="pt-4 border-t border-slate-100 flex items-center gap-3">
                               <span className="text-xs font-black text-rose-500 uppercase tracking-wider">📉 空单过滤参数 (SELL)</span>
+                              <Toggle
+                                enabled={isSingleKSellActive}
+                                onChange={e => updateSingleK({ ...singleK, sellStrategyEnabled: e })}
+                              />
                             </div>
 
-                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                            <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 transition-opacity ${isSingleKSellActive ? '' : 'opacity-50'}`}>
                               {/* K2 过滤 (空) */}
                               <div className="p-5 bg-slate-50/50 rounded-3xl border border-slate-100 space-y-4">
                                 <div className="flex items-center justify-between border-b border-slate-100 pb-2">

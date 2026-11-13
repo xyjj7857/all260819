@@ -53,6 +53,8 @@ export interface ScannerSettings {
     strategyPriority?: 'amplitude' | 'singleK'; // 策略优先级：amplitude (振幅策略优先) | singleK (单K策略优先)
     sharedTableMode?: 'master_snapshot' | 'independent'; // 目标表指标数据模式：master_snapshot (完全一致模式 - 共享主账户快照) | independent (独立实时模式)
     conditions: {
+      buyStrategyEnabled?: boolean;
+      sellStrategyEnabled?: boolean;
       amp: { enabled: boolean; range: [number, number] };
       ampSell?: { enabled: boolean; range: [number, number] };
       longShort: { enabled: boolean; buyEnabled: boolean; buy: number; sellEnabled: boolean; sell: number };
@@ -71,6 +73,8 @@ export interface ScannerSettings {
     };
     singleK?: {
       enabled: boolean;
+      buyStrategyEnabled?: boolean;
+      sellStrategyEnabled?: boolean;
       preferredMode: 'volume' | 'change' | 'amp';
       k2: { enabled: boolean; range: [number, number] };
       a: { enabled: boolean; range: [number, number]; mode: 'fixed' | 'linkK' };

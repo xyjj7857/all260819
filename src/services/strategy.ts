@@ -549,6 +549,12 @@ export class StrategyEngine {
           conditions: {
             ...accDefault.scanner.stage2.conditions,
             ...(loaded.scanner?.stage2?.conditions || {}),
+            buyStrategyEnabled: loaded.scanner?.stage2?.conditions?.buyStrategyEnabled !== undefined
+              ? loaded.scanner.stage2.conditions.buyStrategyEnabled
+              : (loaded.scanner?.stage2?.conditions?.longShort ? loaded.scanner.stage2.conditions.longShort.buyEnabled !== false : true),
+            sellStrategyEnabled: loaded.scanner?.stage2?.conditions?.sellStrategyEnabled !== undefined
+              ? loaded.scanner.stage2.conditions.sellStrategyEnabled
+              : (loaded.scanner?.stage2?.conditions?.longShort ? (loaded.scanner.stage2.conditions.longShort.sellEnabled ?? false) : true),
             amp: {
               ...accDefault.scanner.stage2.conditions.amp,
               ...(loaded.scanner?.stage2?.conditions?.amp || {})
@@ -581,6 +587,12 @@ export class StrategyEngine {
           singleK: {
             ...accDefault.scanner.stage2.singleK,
             ...(loaded.scanner?.stage2?.singleK || {}),
+            buyStrategyEnabled: loaded.scanner?.stage2?.singleK?.buyStrategyEnabled !== undefined
+              ? loaded.scanner.stage2.singleK.buyStrategyEnabled
+              : true,
+            sellStrategyEnabled: loaded.scanner?.stage2?.singleK?.sellStrategyEnabled !== undefined
+              ? loaded.scanner.stage2.singleK.sellStrategyEnabled
+              : true,
             k2: {
               ...(accDefault.scanner.stage2.singleK?.k2 || { enabled: true, range: [4, 9] }),
               ...(loaded.scanner?.stage2?.singleK?.k2 || {})
@@ -3744,6 +3756,15 @@ export class StrategyEngine {
     const { conditions, cooldown, preferredMode = 'volume' } = stage2Config;
     const singleKConfig = stage2Config.singleK;
 
+    const isAmpBuyEnabled = conditions?.buyStrategyEnabled !== undefined
+      ? !!conditions.buyStrategyEnabled
+      : (conditions?.longShort?.buyEnabled !== false);
+    const isAmpSellEnabled = conditions?.sellStrategyEnabled !== undefined
+      ? !!conditions.sellStrategyEnabled
+      : (conditions?.longShort?.sellEnabled ?? false);
+    const isSingleKBuyEnabled = singleKConfig?.buyStrategyEnabled !== false;
+    const isSingleKSellEnabled = singleKConfig?.sellStrategyEnabled !== false;
+
     const accountResults: any[] = [];
 
     for (const item of sharedTable) {
@@ -3755,78 +3776,103 @@ export class StrategyEngine {
       let ampSide: 'BUY' | 'SELL' = 'BUY';
 
       if (isAmpEnabled) {
-        let passed = true;
-        const lsConfig = conditions.longShort;
-        
-        // 1. 多空方向及占比判断
-        if (lsConfig && lsConfig.enabled) {
-          const buyRatio = item.buyRatio;
-          const buyEnabled = lsConfig.buyEnabled !== false;
-          const sellEnabled = lsConfig.sellEnabled ?? false;
-          
-          if (buyEnabled || sellEnabled) {
-             let isPassLocal = false;
-             let localSide: 'BUY' | 'SELL' = 'BUY';
+        if (!isAmpBuyEnabled && !isAmpSellEnabled) {
+          passedAmp = false;
+          failReasonAmp = '振幅多空未开启';
+        } else {
+          let passed = true;
+          const lsConfig = conditions.longShort;
 
-             if (buyEnabled && buyRatio >= lsConfig.buy) {
-                isPassLocal = true;
-                localSide = 'BUY';
-             } else if (sellEnabled && buyRatio <= lsConfig.sell) {
-                isPassLocal = true;
-                localSide = 'SELL';
-             }
-             
-             if (!isPassLocal) {
-                passed = false; 
-                failReasonAmp = `多空:${buyRatio.toFixed(2)}`;
-             } else {
-                ampSide = localSide;
-             }
-          }
-        }
+          // 1. 多空方向及占比判断
+          if (isAmpBuyEnabled && isAmpSellEnabled) {
+            if (lsConfig && lsConfig.enabled) {
+              const buyRatio = item.buyRatio;
+              const buyEnabled = lsConfig.buyEnabled !== false;
+              const sellEnabled = lsConfig.sellEnabled ?? false;
 
-        // 2. 根据确定方向选择多单/空单独立配置进行 AMP、M、资金费率校验
-        if (passed) {
-          const isBuy = ampSide === 'BUY';
-          const ampConfig = isBuy ? conditions.amp : (conditions.ampSell || conditions.amp);
-          const mConfig = isBuy ? conditions.m : (conditions.mSell || conditions.m);
-          const fundingConfig = isBuy ? conditions.fundingRateOptimization : (conditions.fundingRateOptimizationSell || conditions.fundingRateOptimization);
+              if (buyEnabled || sellEnabled) {
+                let isPassLocal = false;
+                let localSide: 'BUY' | 'SELL' = 'BUY';
 
-          if (ampConfig && ampConfig.enabled) {
-            const amplitudeMode = stage2Config.amplitudeMode || 'bottomHigh';
-            const val = amplitudeMode === 'highLow' ? item.ampHighLow : item.ampBottomHigh;
-            const [min, max] = ampConfig.range;
-            if (val < min || val > max) {
-              passed = false;
-              failReasonAmp = `AMP(${isBuy ? '多' : '空'}):${val.toFixed(2)}`;
+                if (buyEnabled && buyRatio >= lsConfig.buy) {
+                  isPassLocal = true;
+                  localSide = 'BUY';
+                } else if (sellEnabled && buyRatio <= lsConfig.sell) {
+                  isPassLocal = true;
+                  localSide = 'SELL';
+                }
+
+                if (!isPassLocal) {
+                  passed = false;
+                  failReasonAmp = `多空:${buyRatio.toFixed(2)}`;
+                } else {
+                  ampSide = localSide;
+                }
+              }
             }
-          }
-
-          if (passed && mConfig && mConfig.enabled) {
-            const val = item.volume15;
-            const [min, max] = mConfig.range;
-            if (val < min || val > max) {
-              passed = false;
-              failReasonAmp = `M(${isBuy ? '多' : '空'}):${(val/1000000).toFixed(2)}M`;
-            }
-          }
-
-          if (passed && fundingConfig && fundingConfig.enabled && ampSide === 'SELL') {
-            const { windowMinutes, shortThreshold } = fundingConfig;
-            const nextTime = (item as any).nextFundingTime || 0;
-            const rate = item.fundingRate || 0;
-            const remainingMs = nextTime - Date.now();
-            
-            if (remainingMs > 0 && remainingMs <= windowMinutes * 60000) {
-              if (rate * 100 <= shortThreshold) {
+          } else if (isAmpBuyEnabled) {
+            ampSide = 'BUY';
+            if (lsConfig && lsConfig.enabled && lsConfig.buyEnabled !== false) {
+              const buyRatio = item.buyRatio;
+              if (buyRatio < lsConfig.buy) {
                 passed = false;
-                failReasonAmp = `资金费优化:Rate(${(rate*100).toFixed(3)}%)<=门槛(${shortThreshold}%)`;
+                failReasonAmp = `多空:${buyRatio.toFixed(2)}`;
+              }
+            }
+          } else {
+            ampSide = 'SELL';
+            if (lsConfig && lsConfig.enabled && (lsConfig.sellEnabled ?? false)) {
+              const buyRatio = item.buyRatio;
+              if (buyRatio > lsConfig.sell) {
+                passed = false;
+                failReasonAmp = `多空:${buyRatio.toFixed(2)}`;
               }
             }
           }
-        }
 
-        passedAmp = passed;
+          // 2. 根据确定方向选择多单/空单独立配置进行 AMP、M、资金费率校验
+          if (passed) {
+            const isBuy = ampSide === 'BUY';
+            const ampConfig = isBuy ? conditions.amp : (conditions.ampSell || conditions.amp);
+            const mConfig = isBuy ? conditions.m : (conditions.mSell || conditions.m);
+            const fundingConfig = isBuy ? conditions.fundingRateOptimization : (conditions.fundingRateOptimizationSell || conditions.fundingRateOptimization);
+
+            if (ampConfig && ampConfig.enabled) {
+              const amplitudeMode = stage2Config.amplitudeMode || 'bottomHigh';
+              const val = amplitudeMode === 'highLow' ? item.ampHighLow : item.ampBottomHigh;
+              const [min, max] = ampConfig.range;
+              if (val < min || val > max) {
+                passed = false;
+                failReasonAmp = `AMP(${isBuy ? '多' : '空'}):${val.toFixed(2)}`;
+              }
+            }
+
+            if (passed && mConfig && mConfig.enabled) {
+              const val = item.volume15;
+              const [min, max] = mConfig.range;
+              if (val < min || val > max) {
+                passed = false;
+                failReasonAmp = `M(${isBuy ? '多' : '空'}):${(val/1000000).toFixed(2)}M`;
+              }
+            }
+
+            if (passed && fundingConfig && fundingConfig.enabled && ampSide === 'SELL') {
+              const { windowMinutes, shortThreshold } = fundingConfig;
+              const nextTime = (item as any).nextFundingTime || 0;
+              const rate = item.fundingRate || 0;
+              const remainingMs = nextTime - Date.now();
+
+              if (remainingMs > 0 && remainingMs <= windowMinutes * 60000) {
+                if (rate * 100 <= shortThreshold) {
+                  passed = false;
+                  failReasonAmp = `资金费优化:Rate(${(rate*100).toFixed(3)}%)<=门槛(${shortThreshold}%)`;
+                }
+              }
+            }
+          }
+
+          passedAmp = passed;
+        }
       }
 
       let passedSingleK = false;
@@ -3836,56 +3882,64 @@ export class StrategyEngine {
       const A_val = singleKSide === 'BUY' ? ((item.high15 - item.current15) / item.current15) * 100 : ((item.current15 - item.low15) / item.current15) * 100;
 
       if (isSingleKEnabled && singleKConfig) {
-        let passed = true;
-        const configK2 = singleKSide === 'BUY' ? singleKConfig.k2 : (singleKConfig.k2Sell || singleKConfig.k2);
-        const configA = singleKSide === 'BUY' ? singleKConfig.a : (singleKConfig.aSell || singleKConfig.a);
-        const configM = singleKSide === 'BUY' ? singleKConfig.m : (singleKConfig.mSell || singleKConfig.m);
+        if (singleKSide === 'BUY' && !isSingleKBuyEnabled) {
+          passedSingleK = false;
+          failReasonSingleK = '单K:多单未开启';
+        } else if (singleKSide === 'SELL' && !isSingleKSellEnabled) {
+          passedSingleK = false;
+          failReasonSingleK = '单K:空单未开启';
+        } else {
+          let passed = true;
+          const configK2 = singleKSide === 'BUY' ? singleKConfig.k2 : (singleKConfig.k2Sell || singleKConfig.k2);
+          const configA = singleKSide === 'BUY' ? singleKConfig.a : (singleKConfig.aSell || singleKConfig.a);
+          const configM = singleKSide === 'BUY' ? singleKConfig.m : (singleKConfig.mSell || singleKConfig.m);
 
-        if (configK2?.enabled) {
-          const [min, max] = configK2.range;
-          const k2_abs = Math.abs(k2_val);
-          if (k2_abs < min || k2_abs > max) {
-            passed = false;
-            failReasonSingleK = `单K:K2(${k2_abs.toFixed(2)}%)`;
-          }
-        }
-        if (passed && configA?.enabled) {
-          const [min, max] = configA.range;
-          const mode = configA.mode || 'fixed';
-          let isPassA = false;
-          const k2_abs = Math.abs(k2_val);
-          if (mode === 'fixed') {
-            isPassA = A_val >= min && A_val <= max;
-          } else {
-            isPassA = k2_abs > 0 && (A_val / k2_abs) >= min && (A_val / k2_abs) <= max;
-          }
-          if (!isPassA) {
-            passed = false;
-            failReasonSingleK = `单K:A(${A_val.toFixed(2)}%,mode:${mode})`;
-          }
-        }
-        if (passed && configM?.enabled) {
-          const [min, max] = configM.range;
-          const val = item.volume15;
-          if (val < min || val > max) {
-            passed = false;
-            failReasonSingleK = `单K:M(${(val/1000000).toFixed(2)}M)`;
-          }
-        }
-        if (passed && singleKSide === 'SELL' && singleKConfig.fundingRateOptimizationSell?.enabled) {
-          const configFunding = singleKConfig.fundingRateOptimizationSell;
-          const nextTime = (item as any).nextFundingTime || 0;
-          const rate = item.fundingRate || 0;
-          const remainingMs = nextTime - Date.now();
-          
-          if (remainingMs > 0 && remainingMs <= configFunding.windowMinutes * 60000) {
-            if (rate * 100 <= configFunding.shortThreshold) {
+          if (configK2?.enabled) {
+            const [min, max] = configK2.range;
+            const k2_abs = Math.abs(k2_val);
+            if (k2_abs < min || k2_abs > max) {
               passed = false;
-              failReasonSingleK = `单K资金费优化:Rate(${(rate * 100).toFixed(3)}%)<=门槛(${configFunding.shortThreshold}%)`;
+              failReasonSingleK = `单K:K2(${k2_abs.toFixed(2)}%)`;
             }
           }
+          if (passed && configA?.enabled) {
+            const [min, max] = configA.range;
+            const mode = configA.mode || 'fixed';
+            let isPassA = false;
+            const k2_abs = Math.abs(k2_val);
+            if (mode === 'fixed') {
+              isPassA = A_val >= min && A_val <= max;
+            } else {
+              isPassA = k2_abs > 0 && (A_val / k2_abs) >= min && (A_val / k2_abs) <= max;
+            }
+            if (!isPassA) {
+              passed = false;
+              failReasonSingleK = `单K:A(${A_val.toFixed(2)}%,mode:${mode})`;
+            }
+          }
+          if (passed && configM?.enabled) {
+            const [min, max] = configM.range;
+            const val = item.volume15;
+            if (val < min || val > max) {
+              passed = false;
+              failReasonSingleK = `单K:M(${(val/1000000).toFixed(2)}M)`;
+            }
+          }
+          if (passed && singleKSide === 'SELL' && singleKConfig.fundingRateOptimizationSell?.enabled) {
+            const configFunding = singleKConfig.fundingRateOptimizationSell;
+            const nextTime = (item as any).nextFundingTime || 0;
+            const rate = item.fundingRate || 0;
+            const remainingMs = nextTime - Date.now();
+
+            if (remainingMs > 0 && remainingMs <= configFunding.windowMinutes * 60000) {
+              if (rate * 100 <= configFunding.shortThreshold) {
+                passed = false;
+                failReasonSingleK = `单K资金费优化:Rate(${(rate * 100).toFixed(3)}%)<=门槛(${configFunding.shortThreshold}%)`;
+              }
+            }
+          }
+          passedSingleK = passed;
         }
-        passedSingleK = passed;
       }
 
       let isPass = false;
@@ -3964,7 +4018,7 @@ export class StrategyEngine {
       });
     }
 
-    const activeSortMode = isAmpEnabled ? (stage2Config.preferredMode || 'volume') : (singleKConfig?.preferredMode || 'volume');
+    const activeSortMode = (isAmpEnabled && (isAmpBuyEnabled || isAmpSellEnabled)) ? (stage2Config.preferredMode || 'volume') : (singleKConfig?.preferredMode || 'volume');
     accountResults.sort((a,b) => {
       if (a.isPass && !b.isPass) return -1;
       if (!a.isPass && b.isPass) return 1;
@@ -4930,16 +4984,16 @@ export class StrategyEngine {
 
   async updateSettings(settings: any) {
     const oldBinance = this.settings.binance || {};
-    this.settings = settings;
+    this.settings = this.mergeSettings(settings);
     
     // 如果 API Key 或 Secret Key 发生变化，则重置仓位模式检查标记
-    const apiKeyChanged = settings.binance?.apiKey !== oldBinance.apiKey;
-    const secretKeyChanged = settings.binance?.secretKey !== oldBinance.secretKey;
+    const apiKeyChanged = this.settings.binance?.apiKey !== oldBinance.apiKey;
+    const secretKeyChanged = this.settings.binance?.secretKey !== oldBinance.secretKey;
     if (apiKeyChanged || secretKeyChanged) {
       this.settings.binance.positionModeChecked = false;
     }
     
-    this.binance = new BinanceService(settings.binance);
+    this.binance = new BinanceService(this.settings.binance);
     
     // Save to database
     await dbService.saveSettings(this.settings, `settings_${this.accountId}`).catch(err => {

@@ -60,6 +60,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
           strategyPriority: 'amplitude',
           sharedTableMode: 'master_snapshot',
           conditions: {
+            buyStrategyEnabled: true,
+            sellStrategyEnabled: true,
             amp: { enabled: true, range: [10, 30] },
             ampSell: { enabled: true, range: [10, 30] },
             longShort: { enabled: true, buyEnabled: true, buy: 80, sellEnabled: true, sell: 20 },
@@ -70,6 +72,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
           },
           singleK: {
             enabled: false,
+            buyStrategyEnabled: true,
+            sellStrategyEnabled: true,
             preferredMode: 'volume',
             k2: { enabled: true, range: [4, 9] },
             a: { enabled: true, range: [0, 3], mode: 'fixed' },
@@ -274,6 +278,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
           preferredMode: 'amp',
           amplitudeMode: 'bottomHigh',
           conditions: {
+            buyStrategyEnabled: true,
+            sellStrategyEnabled: false,
             amp: { enabled: true, range: [10, 30] },
             longShort: { enabled: true, buyEnabled: true, buy: 80, sellEnabled: false, sell: 20 },
             m: { enabled: true, range: [2980000, 1000000000] },
@@ -281,6 +287,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
           },
           singleK: {
             enabled: false,
+            buyStrategyEnabled: true,
+            sellStrategyEnabled: true,
             preferredMode: 'volume',
             k2: { enabled: true, range: [4, 9] },
             a: { enabled: true, range: [0, 3], mode: 'fixed' },

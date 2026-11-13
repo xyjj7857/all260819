@@ -97,6 +97,7 @@ function mergeSettings(loaded: any): AppSettings {
         name: loaded.name || defAcc.name,
         enabled: loaded.enabled !== undefined ? loaded.enabled : defAcc.enabled,
         isMasterAccount: true,
+        initialCumPnl: loaded.initialCumPnl !== undefined ? Number(loaded.initialCumPnl) : 0,
         binance: loaded.binance || defAcc.binance,
         scanner: loaded.scanner || defAcc.scanner,
         order: loaded.order || defAcc.order,
@@ -117,6 +118,30 @@ function mergeSettings(loaded: any): AppSettings {
     mergedAcc.enabled = mergedAcc.enabled !== undefined ? mergedAcc.enabled : defAcc.enabled;
     mergedAcc.isMasterAccount = mergedAcc.isMasterAccount !== undefined ? mergedAcc.isMasterAccount : (defAcc.isMasterAccount || false);
     mergedAcc.initialCumPnl = mergedAcc.initialCumPnl !== undefined ? Number(mergedAcc.initialCumPnl) : (defAcc.initialCumPnl || 0);
+
+    // Backward-compatible defaults for sub-strategy switches
+    const rawConds = acc.scanner?.stage2?.conditions;
+    if (mergedAcc.scanner?.stage2?.conditions) {
+      if (rawConds?.buyStrategyEnabled === undefined) {
+        mergedAcc.scanner.stage2.conditions.buyStrategyEnabled = rawConds?.longShort
+          ? rawConds.longShort.buyEnabled !== false
+          : true;
+      }
+      if (rawConds?.sellStrategyEnabled === undefined) {
+        mergedAcc.scanner.stage2.conditions.sellStrategyEnabled = rawConds?.longShort
+          ? (rawConds.longShort.sellEnabled ?? false)
+          : true;
+      }
+    }
+    const rawSingleK = acc.scanner?.stage2?.singleK;
+    if (mergedAcc.scanner?.stage2?.singleK) {
+      if (rawSingleK?.buyStrategyEnabled === undefined) {
+        mergedAcc.scanner.stage2.singleK.buyStrategyEnabled = true;
+      }
+      if (rawSingleK?.sellStrategyEnabled === undefined) {
+        mergedAcc.scanner.stage2.singleK.sellStrategyEnabled = true;
+      }
+    }
 
     // Ensure time control 96 slots structure
     const rawTc = acc.scanner?.timeControl || {};
@@ -1135,9 +1160,22 @@ async function startServer() {
       };
       
       await req.engine.updateSettings(newSettings);
+
+      const globalSettings = await loadSettings();
+      const accIdx = globalSettings.accounts.findIndex((a: any) => a.id === req.engine.accountId);
+      if (accIdx !== -1) {
+        globalSettings.accounts[accIdx] = {
+          ...globalSettings.accounts[accIdx],
+          binance: accDefaults.binance,
+          scanner: accDefaults.scanner,
+          order: accDefaults.order,
+          withdrawal: accDefaults.withdrawal
+        };
+        await saveGlobalSettings(globalSettings);
+      }
       
       release();
-      res.json({ success: true, settings: newSettings });
+      res.json({ success: true, settings: req.engine.getSettings() });
     } catch (error: any) {
       if (typeof release === 'function') release();
       console.error("Failed to restore settings:", error.message);
@@ -1153,9 +1191,32 @@ async function startServer() {
 
       // Calculate the real-time cumulative PnL for each account and update its initialCumPnl
       if (Array.isArray(exportSettings.accounts)) {
-        for (const account of exportSettings.accounts) {
+        for (let i = 0; i < exportSettings.accounts.length; i++) {
+          let account = exportSettings.accounts[i];
           const accountId = account.id || 'default';
           const engine = engines.get(accountId);
+
+          // Ensure exported parameters reflect the latest persisted settings in SQLite / engine
+          const dbAccSettings = await dbService.getSettings(`settings_${accountId}`).catch(() => null);
+          const liveAccSettings = engine ? engine.getSettings() : null;
+          const latestSource = liveAccSettings || dbAccSettings;
+          if (latestSource && typeof latestSource === 'object') {
+            const normalizedAcc = mergeSettings({
+              accounts: [{
+                ...account,
+                name: latestSource.name || account.name,
+                enabled: latestSource.enabled !== undefined ? latestSource.enabled : account.enabled,
+                isMasterAccount: latestSource.isMasterAccount !== undefined ? latestSource.isMasterAccount : account.isMasterAccount,
+                initialCumPnl: latestSource.initialCumPnl !== undefined ? Number(latestSource.initialCumPnl) : account.initialCumPnl,
+                binance: latestSource.binance || account.binance,
+                scanner: latestSource.scanner || account.scanner,
+                order: latestSource.order || account.order,
+                withdrawal: latestSource.withdrawal || account.withdrawal,
+              }]
+            }).accounts[0];
+            exportSettings.accounts[i] = normalizedAcc;
+            account = normalizedAcc;
+          }
           
           let dbLogs: any[] = [];
           try {
@@ -1406,6 +1467,8 @@ async function startServer() {
         await req.engine.updateSettings(settings);
       }
       
+      const savedEngineSettings = req.engine ? req.engine.getSettings() : settings;
+
       // Update global settings set
       const globalSettings = await loadSettings();
       
@@ -1415,22 +1478,24 @@ async function startServer() {
       if (settings.auth) globalSettings.auth = settings.auth;
       if (settings.remoteControl) globalSettings.remoteControl = settings.remoteControl;
       
-      // Update account-specific fields
+      // Update account-specific fields (normalized via engine/mergeSettings so all new & legacy keys persist)
       if (accountId) {
         const accountIdx = globalSettings.accounts.findIndex(acc => acc.id === accountId);
         if (accountIdx !== -1) {
-          // Merge allowed account-specific fields
-          globalSettings.accounts[accountIdx] = {
-            ...globalSettings.accounts[accountIdx],
-            name: settings.name || globalSettings.accounts[accountIdx].name,
-            initialCumPnl: settings.initialCumPnl !== undefined ? Number(settings.initialCumPnl) : (globalSettings.accounts[accountIdx].initialCumPnl ?? 0),
-            isMasterAccount: settings.isMasterAccount !== undefined ? settings.isMasterAccount : (globalSettings.accounts[accountIdx].isMasterAccount ?? false),
-            binance: settings.binance || globalSettings.accounts[accountIdx].binance,
-            scanner: settings.scanner || globalSettings.accounts[accountIdx].scanner,
-            order: settings.order || globalSettings.accounts[accountIdx].order,
-            withdrawal: settings.withdrawal || globalSettings.accounts[accountIdx].withdrawal,
-            enabled: settings.enabled !== undefined ? settings.enabled : globalSettings.accounts[accountIdx].enabled
-          };
+          const normalizedAcc = mergeSettings({
+            accounts: [{
+              ...globalSettings.accounts[accountIdx],
+              name: savedEngineSettings.name || globalSettings.accounts[accountIdx].name,
+              initialCumPnl: savedEngineSettings.initialCumPnl !== undefined ? Number(savedEngineSettings.initialCumPnl) : (globalSettings.accounts[accountIdx].initialCumPnl ?? 0),
+              isMasterAccount: savedEngineSettings.isMasterAccount !== undefined ? savedEngineSettings.isMasterAccount : (globalSettings.accounts[accountIdx].isMasterAccount ?? false),
+              binance: savedEngineSettings.binance || globalSettings.accounts[accountIdx].binance,
+              scanner: savedEngineSettings.scanner || globalSettings.accounts[accountIdx].scanner,
+              order: savedEngineSettings.order || globalSettings.accounts[accountIdx].order,
+              withdrawal: savedEngineSettings.withdrawal || globalSettings.accounts[accountIdx].withdrawal,
+              enabled: savedEngineSettings.enabled !== undefined ? savedEngineSettings.enabled : globalSettings.accounts[accountIdx].enabled
+            }]
+          }).accounts[0];
+          globalSettings.accounts[accountIdx] = normalizedAcc;
         }
       }
       
